@@ -1,0 +1,10 @@
+title       = "inaturalist"
+baseURL     = "https://inaturalist-cli.tamnd.com/"
+description = "Browse iNaturalist nature observations from the terminal"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/inaturalist-cli"
