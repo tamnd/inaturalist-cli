@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"unicode"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -31,9 +32,9 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "Browse iNaturalist nature observations from the terminal",
 			Long: `Browse iNaturalist nature observations from the terminal.
 
-inaturalist reads taxa, observations, species counts, and places from the iNaturalist
-API (api.inaturalist.org) over plain HTTPS, shapes the data into clean records, and
-prints output that pipes into the rest of your tools. No API key required.`,
+inaturalist reads taxa, observations, and species detail from the iNaturalist
+API (api.inaturalist.org) over plain HTTPS, shapes the data into clean records,
+and prints output that pipes into the rest of your tools. No API key required.`,
 			Site: "inaturalist.org",
 			Repo: "https://github.com/tamnd/inaturalist-cli",
 		},
@@ -44,18 +45,19 @@ prints output that pipes into the rest of your tools. No API key required.`,
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	kit.Handle(app, kit.OpMeta{Name: "taxa", Group: "taxonomy", List: true,
-		Summary: "Search taxa by name"}, listTaxa)
-
-	kit.Handle(app, kit.OpMeta{Name: "taxon", Group: "taxonomy", Single: true,
-		Summary: "Get a taxon by numeric iNaturalist ID",
-		Args:    []kit.Arg{{Name: "id", Help: "iNaturalist taxon ID (integer)"}}}, getTaxon)
-
 	kit.Handle(app, kit.OpMeta{Name: "observations", Group: "observation", List: true,
-		Summary: "Search observation records"}, listObservations)
+		Summary: "Search nature observation records"}, listObservations)
+
+	kit.Handle(app, kit.OpMeta{Name: "taxa", Group: "taxonomy", List: true,
+		Summary: "Search species and taxa by name",
+		Args:    []kit.Arg{{Name: "query", Help: "taxon name to search"}}}, listTaxa)
+
+	kit.Handle(app, kit.OpMeta{Name: "species", Group: "taxonomy", Single: true,
+		Summary: "Get species detail by taxon ID",
+		Args:    []kit.Arg{{Name: "id", Help: "iNaturalist taxon ID (integer)"}}}, getSpecies)
 
 	kit.Handle(app, kit.OpMeta{Name: "species-counts", Group: "observation", List: true,
-		Summary: "Get species count summary for a place"}, listSpeciesCounts)
+		Summary: "Top species by observation count for a place"}, listSpeciesCounts)
 
 	kit.Handle(app, kit.OpMeta{Name: "places", Group: "place", List: true,
 		Summary: "Search places by name",
@@ -82,23 +84,26 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 
 // ─── input structs ────────────────────────────────────────────────────────────
 
-type taxaInput struct {
-	Search string  `kit:"flag" help:"taxon name to search"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
-
-type taxonInput struct {
-	ID     string  `kit:"arg" help:"iNaturalist taxon ID (integer)"`
-	Client *Client `kit:"inject"`
-}
-
 type observationsInput struct {
-	Taxon   string  `kit:"flag" help:"taxon name to filter by"`
-	Place   int     `kit:"flag" help:"place ID to filter by"`
+	Query   string  `kit:"flag" help:"text search query"`
+	Taxon   string  `kit:"flag" help:"taxon name or numeric ID"`
+	Place   string  `kit:"flag" help:"place name to filter by"`
 	Quality string  `kit:"flag" help:"quality grade: research, needs_id, casual"`
+	Photos  bool    `kit:"flag" help:"only return observations with photos"`
 	Limit   int     `kit:"flag,inherit" help:"max results"`
 	Client  *Client `kit:"inject"`
+}
+
+type taxaInput struct {
+	Query  string  `kit:"arg" help:"taxon name to search"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Rank   string  `kit:"flag" help:"rank filter: species, genus, family, order"`
+	Client *Client `kit:"inject"`
+}
+
+type speciesInput struct {
+	ID     string  `kit:"arg" help:"iNaturalist taxon ID (integer)"`
+	Client *Client `kit:"inject"`
 }
 
 type speciesCountsInput struct {
@@ -114,37 +119,25 @@ type placesInput struct {
 
 // ─── handlers ─────────────────────────────────────────────────────────────────
 
-func listTaxa(ctx context.Context, in taxaInput, emit func(*Taxon) error) error {
-	items, err := in.Client.SearchTaxa(ctx, in.Search, in.Limit)
-	if err != nil {
-		return err
-	}
-	for i := range items {
-		if err := emit(&items[i]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func getTaxon(ctx context.Context, in taxonInput, emit func(*Taxon) error) error {
-	id, err := strconv.Atoi(in.ID)
-	if err != nil {
-		return errs.Usage("taxon id must be a number, got %q", in.ID)
-	}
-	item, err := in.Client.GetTaxon(ctx, id)
-	if err != nil {
-		return err
-	}
-	return emit(&item)
-}
-
 func listObservations(ctx context.Context, in observationsInput, emit func(*Observation) error) error {
+	if in.Limit <= 0 {
+		in.Limit = 20
+	}
 	p := ObservationParams{
-		TaxonName:    in.Taxon,
-		PlaceID:      in.Place,
+		Query:        in.Query,
+		PlaceName:    in.Place,
 		QualityGrade: in.Quality,
+		Photos:       in.Photos,
 		Limit:        in.Limit,
+	}
+	// taxon can be a numeric ID or a name
+	if in.Taxon != "" {
+		if isNumeric(in.Taxon) {
+			id, _ := strconv.Atoi(in.Taxon)
+			p.TaxonID = id
+		} else {
+			p.TaxonName = in.Taxon
+		}
 	}
 	items, err := in.Client.SearchObservations(ctx, p)
 	if err != nil {
@@ -156,6 +149,34 @@ func listObservations(ctx context.Context, in observationsInput, emit func(*Obse
 		}
 	}
 	return nil
+}
+
+func listTaxa(ctx context.Context, in taxaInput, emit func(*Taxon) error) error {
+	if in.Limit <= 0 {
+		in.Limit = 20
+	}
+	items, err := in.Client.SearchTaxa(ctx, in.Query, in.Rank, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getSpecies(ctx context.Context, in speciesInput, emit func(*Taxon) error) error {
+	id, err := strconv.Atoi(in.ID)
+	if err != nil {
+		return errs.Usage("taxon id must be a number, got %q", in.ID)
+	}
+	item, err := in.Client.GetTaxon(ctx, id)
+	if err != nil {
+		return err
+	}
+	return emit(&item)
 }
 
 func listSpeciesCounts(ctx context.Context, in speciesCountsInput, emit func(*PlaceCount) error) error {
@@ -182,6 +203,19 @@ func listPlaces(ctx context.Context, in placesInput, emit func(*Place) error) er
 		}
 	}
 	return nil
+}
+
+// isNumeric returns true if s consists entirely of digits.
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // ─── URI driver (pure string functions, network-free) ─────────────────────────

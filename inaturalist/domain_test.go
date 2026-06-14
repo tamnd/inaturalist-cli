@@ -22,21 +22,21 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassifyTaxon(t *testing.T) {
-	typ, id, err := inaturalist.Domain{}.Classify("41869")
+	typ, id, err := inaturalist.Domain{}.Classify("48662")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if typ != "taxon" {
 		t.Errorf("type = %q, want taxon", typ)
 	}
-	if id != "41869" {
-		t.Errorf("id = %q, want 41869", id)
+	if id != "48662" {
+		t.Errorf("id = %q, want 48662", id)
 	}
 }
 
 func TestLocateTaxon(t *testing.T) {
-	got, err := inaturalist.Domain{}.Locate("taxon", "41869")
-	want := "https://www.inaturalist.org/taxa/41869"
+	got, err := inaturalist.Domain{}.Locate("taxon", "48662")
+	want := "https://www.inaturalist.org/taxa/48662"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}

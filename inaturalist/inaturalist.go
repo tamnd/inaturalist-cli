@@ -15,12 +15,13 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // DefaultUserAgent identifies the client to the iNaturalist API.
-const DefaultUserAgent = "inaturalist-cli/0.1.0 (github.com/tamnd/inaturalist-cli)"
+const DefaultUserAgent = "inaturalist-cli/0.1 (tamnd87@gmail.com)"
 
 // Host is the iNaturalist API hostname.
 const Host = "api.inaturalist.org"
@@ -42,8 +43,8 @@ func DefaultConfig() Config {
 	return Config{
 		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Timeout:   30 * time.Second,
+		Rate:      300 * time.Millisecond,
+		Timeout:   15 * time.Second,
 		Retries:   3,
 	}
 }
@@ -69,25 +70,33 @@ func NewClient(cfg Config) *Client {
 	}
 }
 
-// Taxon represents a species or higher taxonomic group from iNaturalist.
-type Taxon struct {
-	ID                int    `json:"id"`
-	Name              string `json:"name"`
-	Rank              string `json:"rank"`
-	CommonName        string `json:"common_name"`
-	WikipediaURL      string `json:"wikipedia_url"`
-	ObservationsCount int    `json:"observations_count"`
-	URL               string `json:"url"`
-}
-
 // Observation is a single nature observation record from iNaturalist.
 type Observation struct {
-	ID           int    `json:"id"`
-	SpeciesGuess string `json:"species_guess"`
-	PlaceGuess   string `json:"place_guess"`
-	QualityGrade string `json:"quality_grade"`
-	ObservedOn   string `json:"observed_on"`
-	URL          string `json:"url"`
+	ID             int    `kit:"id" json:"id"`
+	ObservedOn     string `json:"observed_on"`
+	Species        string `json:"species"`         // common name (taxon.preferred_common_name) or scientific name
+	ScientificName string `json:"scientific_name"` // taxon.name
+	Place          string `json:"place"`           // place_guess
+	Observer       string `json:"observer"`        // user.login
+	Quality        string `json:"quality"`         // quality_grade
+	PhotoURL       string `json:"photo_url"`       // photos[0].url with small replaced by medium
+}
+
+// Taxon represents a species or higher taxonomic group from iNaturalist.
+type Taxon struct {
+	ID           int    `kit:"id" json:"id"`
+	Name         string `json:"name"`          // scientific name
+	CommonName   string `json:"common_name"`   // preferred_common_name
+	Rank         string `json:"rank"`
+	Observations int    `json:"observations"`  // observations_count
+	WikipediaURL string `json:"wikipedia_url"`
+}
+
+// Place is a geographic place from the places autocomplete endpoint.
+type Place struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
 }
 
 // PlaceCount is an entry from the species_counts endpoint.
@@ -98,18 +107,14 @@ type PlaceCount struct {
 	Rank       string `json:"rank"`
 }
 
-// Place is a geographic place from the places autocomplete endpoint.
-type Place struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	DisplayName string `json:"display_name"`
-}
-
 // ObservationParams holds optional filters for observation searches.
 type ObservationParams struct {
+	Query        string
 	TaxonName    string
-	PlaceID      int
+	TaxonID      int
+	PlaceName    string
 	QualityGrade string
+	Photos       bool
 	Limit        int
 }
 
@@ -139,11 +144,22 @@ type obsListResp struct {
 }
 
 type wireObservation struct {
-	ID           int    `json:"id"`
-	SpeciesGuess string `json:"species_guess"`
-	PlaceGuess   string `json:"place_guess"`
-	QualityGrade string `json:"quality_grade"`
-	ObservedOn   string `json:"observed_on"`
+	ID           int          `json:"id"`
+	SpeciesGuess string       `json:"species_guess"`
+	PlaceGuess   string       `json:"place_guess"`
+	QualityGrade string       `json:"quality_grade"`
+	ObservedOn   string       `json:"observed_on"`
+	Taxon        *wireTaxon   `json:"taxon"`
+	User         wireUser     `json:"user"`
+	Photos       []wirePhoto  `json:"photos"`
+}
+
+type wireUser struct {
+	Login string `json:"login"`
+}
+
+type wirePhoto struct {
+	URL string `json:"url"`
 }
 
 type speciesCountsResp struct {
@@ -175,25 +191,49 @@ type wirePlace struct {
 
 func wireTaxonToTaxon(w wireTaxon) Taxon {
 	return Taxon{
-		ID:                w.ID,
-		Name:              w.Name,
-		Rank:              w.Rank,
-		CommonName:        w.PreferredCommonName,
-		WikipediaURL:      w.WikipediaURL,
-		ObservationsCount: w.ObservationsCount,
-		URL:               "https://www.inaturalist.org/taxa/" + strconv.Itoa(w.ID),
+		ID:           w.ID,
+		Name:         w.Name,
+		Rank:         w.Rank,
+		CommonName:   w.PreferredCommonName,
+		WikipediaURL: w.WikipediaURL,
+		Observations: w.ObservationsCount,
 	}
 }
 
 func wireObsToObservation(w wireObservation) Observation {
-	return Observation{
-		ID:           w.ID,
-		SpeciesGuess: w.SpeciesGuess,
-		PlaceGuess:   w.PlaceGuess,
-		QualityGrade: w.QualityGrade,
-		ObservedOn:   w.ObservedOn,
-		URL:          "https://www.inaturalist.org/observations/" + strconv.Itoa(w.ID),
+	o := Observation{
+		ID:         w.ID,
+		ObservedOn: w.ObservedOn,
+		Place:      w.PlaceGuess,
+		Observer:   w.User.Login,
+		Quality:    w.QualityGrade,
 	}
+	if w.Taxon != nil {
+		o.ScientificName = w.Taxon.Name
+		if w.Taxon.PreferredCommonName != "" {
+			o.Species = w.Taxon.PreferredCommonName
+		} else {
+			o.Species = w.Taxon.Name
+		}
+	} else if w.SpeciesGuess != "" {
+		o.Species = w.SpeciesGuess
+	}
+	if len(w.Photos) > 0 {
+		rawURL := w.Photos[0].URL
+		// The API returns thumbnail URLs using size suffixes like /square, /small, /thumb.
+		// We upgrade to /medium for a better-resolution default.
+		switch {
+		case strings.Contains(rawURL, "/square"):
+			o.PhotoURL = strings.Replace(rawURL, "/square", "/medium", 1)
+		case strings.Contains(rawURL, "/small"):
+			o.PhotoURL = strings.Replace(rawURL, "/small", "/medium", 1)
+		case strings.Contains(rawURL, "/thumb"):
+			o.PhotoURL = strings.Replace(rawURL, "/thumb", "/medium", 1)
+		default:
+			o.PhotoURL = rawURL
+		}
+	}
+	return o
 }
 
 func wireCountToPlaceCount(w wireSpeciesCount) PlaceCount {
@@ -215,14 +255,17 @@ func wirePlaceToPlace(w wirePlace) Place {
 
 // ─── public methods ───────────────────────────────────────────────────────────
 
-// SearchTaxa searches the /taxa endpoint by name.
-func (c *Client) SearchTaxa(ctx context.Context, query string, limit int) ([]Taxon, error) {
+// SearchTaxa searches the /taxa endpoint by name and optional rank.
+func (c *Client) SearchTaxa(ctx context.Context, query, rank string, limit int) ([]Taxon, error) {
 	if limit <= 0 {
-		limit = 10
+		limit = 20
 	}
 	params := url.Values{}
 	params.Set("q", query)
 	params.Set("per_page", strconv.Itoa(limit))
+	if rank != "" {
+		params.Set("rank", rank)
+	}
 	rawURL := c.cfg.BaseURL + "/taxa?" + params.Encode()
 
 	body, err := c.get(ctx, rawURL)
@@ -241,7 +284,6 @@ func (c *Client) SearchTaxa(ctx context.Context, query string, limit int) ([]Tax
 }
 
 // GetTaxon fetches a single taxon by its numeric iNaturalist ID.
-// The API wraps results in a results array; this returns the first element.
 func (c *Client) GetTaxon(ctx context.Context, id int) (Taxon, error) {
 	rawURL := c.cfg.BaseURL + "/taxa/" + strconv.Itoa(id)
 	body, err := c.get(ctx, rawURL)
@@ -261,18 +303,27 @@ func (c *Client) GetTaxon(ctx context.Context, id int) (Taxon, error) {
 // SearchObservations searches observation records with optional filters.
 func (c *Client) SearchObservations(ctx context.Context, p ObservationParams) ([]Observation, error) {
 	if p.Limit <= 0 {
-		p.Limit = 10
+		p.Limit = 20
+	}
+	if p.QualityGrade == "" {
+		p.QualityGrade = "research"
 	}
 	params := url.Values{}
 	params.Set("per_page", strconv.Itoa(p.Limit))
-	if p.TaxonName != "" {
+	params.Set("quality_grade", p.QualityGrade)
+	if p.Query != "" {
+		params.Set("q", p.Query)
+	}
+	if p.TaxonID > 0 {
+		params.Set("taxon_id", strconv.Itoa(p.TaxonID))
+	} else if p.TaxonName != "" {
 		params.Set("taxon_name", p.TaxonName)
 	}
-	if p.PlaceID > 0 {
-		params.Set("place_id", strconv.Itoa(p.PlaceID))
+	if p.PlaceName != "" {
+		params.Set("place_name", p.PlaceName)
 	}
-	if p.QualityGrade != "" {
-		params.Set("quality_grade", p.QualityGrade)
+	if p.Photos {
+		params.Set("photos", "true")
 	}
 	rawURL := c.cfg.BaseURL + "/observations?" + params.Encode()
 
