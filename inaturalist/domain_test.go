@@ -1,76 +1,66 @@
-package inaturalist
+package inaturalist_test
 
 import (
 	"testing"
 
-	"github.com/tamnd/any-cli/kit"
+	"github.com/tamnd/inaturalist-cli/inaturalist"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in inaturalist_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
 
 func TestDomainInfo(t *testing.T) {
-	info := Domain{}.Info()
+	info := inaturalist.Domain{}.Info()
 	if info.Scheme != "inaturalist" {
 		t.Errorf("Scheme = %q, want inaturalist", info.Scheme)
 	}
-	if len(info.Hosts) == 0 || info.Hosts[0] != Host {
-		t.Errorf("Hosts = %v, want [%s]", info.Hosts, Host)
+	if len(info.Hosts) == 0 || info.Hosts[0] != inaturalist.Host {
+		t.Errorf("Hosts = %v, want [%s]", info.Hosts, inaturalist.Host)
 	}
 	if info.Identity.Binary != "inaturalist" {
 		t.Errorf("Identity.Binary = %q, want inaturalist", info.Identity.Binary)
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+func TestClassifyTaxon(t *testing.T) {
+	typ, id, err := inaturalist.Domain{}.Classify("41869")
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
+	if typ != "taxon" {
+		t.Errorf("type = %q, want taxon", typ)
+	}
+	if id != "41869" {
+		t.Errorf("id = %q, want 41869", id)
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+func TestLocateTaxon(t *testing.T) {
+	got, err := inaturalist.Domain{}.Locate("taxon", "41869")
+	want := "https://www.inaturalist.org/taxa/41869"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+func TestLocateObservation(t *testing.T) {
+	got, err := inaturalist.Domain{}.Locate("observation", "123456")
+	want := "https://www.inaturalist.org/observations/123456"
+	if err != nil || got != want {
+		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
+func TestLocatePlace(t *testing.T) {
+	got, err := inaturalist.Domain{}.Locate("place", "6903")
+	want := "https://www.inaturalist.org/places/6903"
+	if err != nil || got != want {
+		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
-	if want := "inaturalist://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
+}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("inaturalist", "about")
-	if err != nil || got.String() != "inaturalist://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want inaturalist://page/about", got.String(), err)
+func TestLocateUnknownType(t *testing.T) {
+	_, err := inaturalist.Domain{}.Locate("bogus", "123")
+	if err == nil {
+		t.Error("expected error for unknown resource type")
 	}
 }

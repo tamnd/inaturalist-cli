@@ -1,35 +1,27 @@
+// Package inaturalist exposes iNaturalist data as a kit Domain.
+// A multi-domain host (ant) enables this driver with a single blank import:
+//
+//	import _ "github.com/tamnd/inaturalist-cli/inaturalist"
+//
+// The same Domain also builds the standalone inaturalist binary.
 package inaturalist
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"strconv"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes inaturalist as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/inaturalist-cli/inaturalist"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// inaturalist:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone inaturalist binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the inaturalist driver. It carries no state; the per-run client is
+// Domain is the iNaturalist driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "inaturalist",
@@ -37,41 +29,42 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "inaturalist",
 			Short:  "Browse iNaturalist nature observations from the terminal",
-			Long: `Browse iNaturalist nature observations from the terminal
+			Long: `Browse iNaturalist nature observations from the terminal.
 
-inaturalist reads public inaturalist data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+inaturalist reads taxa, observations, species counts, and places from the iNaturalist
+API (api.inaturalist.org) over plain HTTPS, shapes the data into clean records, and
+prints output that pipes into the rest of your tools. No API key required.`,
+			Site: "inaturalist.org",
 			Repo: "https://github.com/tamnd/inaturalist-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `inaturalist page` and
-	// `ant get inaturalist://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "taxa", Group: "taxonomy", List: true,
+		Summary: "Search taxa by name"}, listTaxa)
 
-	// List op: members of a page, the home of `inaturalist links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// inaturalist://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "taxon", Group: "taxonomy", Single: true,
+		Summary: "Get a taxon by numeric iNaturalist ID",
+		Args:    []kit.Arg{{Name: "id", Help: "iNaturalist taxon ID (integer)"}}}, getTaxon)
+
+	kit.Handle(app, kit.OpMeta{Name: "observations", Group: "observation", List: true,
+		Summary: "Search observation records"}, listObservations)
+
+	kit.Handle(app, kit.OpMeta{Name: "species-counts", Group: "observation", List: true,
+		Summary: "Get species count summary for a place"}, listSpeciesCounts)
+
+	kit.Handle(app, kit.OpMeta{Name: "places", Group: "place", List: true,
+		Summary: "Search places by name",
+		Args:    []kit.Arg{{Name: "query", Help: "place name to search"}}}, listPlaces)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from kit config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +75,132 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// ─── input structs ────────────────────────────────────────────────────────────
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
-}
-
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type taxaInput struct {
+	Search string  `kit:"flag" help:"taxon name to search"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type taxonInput struct {
+	ID     string  `kit:"arg" help:"iNaturalist taxon ID (integer)"`
+	Client *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+type observationsInput struct {
+	Taxon   string  `kit:"flag" help:"taxon name to filter by"`
+	Place   int     `kit:"flag" help:"place ID to filter by"`
+	Quality string  `kit:"flag" help:"quality grade: research, needs_id, casual"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
+}
+
+type speciesCountsInput struct {
+	Place  int     `kit:"flag" help:"place ID"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type placesInput struct {
+	Query  string  `kit:"arg" help:"place name to search"`
+	Client *Client `kit:"inject"`
+}
+
+// ─── handlers ─────────────────────────────────────────────────────────────────
+
+func listTaxa(ctx context.Context, in taxaInput, emit func(*Taxon) error) error {
+	items, err := in.Client.SearchTaxa(ctx, in.Search, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full inaturalist.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized inaturalist reference: %q", input)
+func getTaxon(ctx context.Context, in taxonInput, emit func(*Taxon) error) error {
+	id, err := strconv.Atoi(in.ID)
+	if err != nil {
+		return errs.Usage("taxon id must be a number, got %q", in.ID)
 	}
-	return "page", id, nil
+	item, err := in.Client.GetTaxon(ctx, id)
+	if err != nil {
+		return err
+	}
+	return emit(&item)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("inaturalist has no resource type %q", uriType)
+func listObservations(ctx context.Context, in observationsInput, emit func(*Observation) error) error {
+	p := ObservationParams{
+		TaxonName:    in.Taxon,
+		PlaceID:      in.Place,
+		QualityGrade: in.Quality,
+		Limit:        in.Limit,
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	items, err := in.Client.SearchObservations(ctx, p)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+func listSpeciesCounts(ctx context.Context, in speciesCountsInput, emit func(*PlaceCount) error) error {
+	items, err := in.Client.SpeciesCounts(ctx, in.Place, in.Limit)
+	if err != nil {
+		return err
 	}
-	return strings.Trim(input, "/")
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+func listPlaces(ctx context.Context, in placesInput, emit func(*Place) error) error {
+	items, err := in.Client.SearchPlaces(ctx, in.Query)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ─── URI driver (pure string functions, network-free) ─────────────────────────
+
+// Classify turns a taxon id or iNaturalist URL into (type, id).
+func (Domain) Classify(input string) (string, string, error) {
+	return "taxon", input, nil
+}
+
+// Locate returns the live https URL for a (type, id).
+func (Domain) Locate(t, id string) (string, error) {
+	switch t {
+	case "taxon":
+		return fmt.Sprintf("https://www.inaturalist.org/taxa/%s", id), nil
+	case "observation":
+		return fmt.Sprintf("https://www.inaturalist.org/observations/%s", id), nil
+	case "place":
+		return fmt.Sprintf("https://www.inaturalist.org/places/%s", id), nil
+	default:
+		return "", errs.Usage("inaturalist has no resource type %q", t)
+	}
 }

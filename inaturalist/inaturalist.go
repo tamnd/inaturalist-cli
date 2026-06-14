@@ -1,62 +1,349 @@
 // Package inaturalist is the library behind the inaturalist command line:
-// the HTTP client, request shaping, and the typed data models for inaturalist.
+// the HTTP client, request shaping, wire decoding, and typed data models
+// for the iNaturalist REST API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The API at https://api.inaturalist.org/v1 is entirely public and requires no
+// authentication key for read-only access. The Client paces requests, sets a
+// real User-Agent, and retries transient failures (429 and 5xx).
 package inaturalist
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to inaturalist. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "inaturalist/dev (+https://github.com/tamnd/inaturalist-cli)"
+// DefaultUserAgent identifies the client to the iNaturalist API.
+const DefaultUserAgent = "inaturalist-cli/0.1.0 (github.com/tamnd/inaturalist-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at inaturalist.com; change it once you
-// know the real endpoints you want to read.
-const Host = "inaturalist.com"
+// Host is the iNaturalist API hostname.
+const Host = "api.inaturalist.org"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the root every API request is built from.
+const BaseURL = "https://" + Host + "/v1"
 
-// Client talks to inaturalist over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the iNaturalist REST API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client built from cfg.
+func NewClient(cfg Config) *Client {
+	base := cfg.BaseURL
+	if base == "" {
+		base = BaseURL
+	}
+	cfg.BaseURL = base
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Taxon represents a species or higher taxonomic group from iNaturalist.
+type Taxon struct {
+	ID                int    `json:"id"`
+	Name              string `json:"name"`
+	Rank              string `json:"rank"`
+	CommonName        string `json:"common_name"`
+	WikipediaURL      string `json:"wikipedia_url"`
+	ObservationsCount int    `json:"observations_count"`
+	URL               string `json:"url"`
+}
+
+// Observation is a single nature observation record from iNaturalist.
+type Observation struct {
+	ID           int    `json:"id"`
+	SpeciesGuess string `json:"species_guess"`
+	PlaceGuess   string `json:"place_guess"`
+	QualityGrade string `json:"quality_grade"`
+	ObservedOn   string `json:"observed_on"`
+	URL          string `json:"url"`
+}
+
+// PlaceCount is an entry from the species_counts endpoint.
+type PlaceCount struct {
+	Count      int    `json:"count"`
+	Name       string `json:"name"`
+	CommonName string `json:"common_name"`
+	Rank       string `json:"rank"`
+}
+
+// Place is a geographic place from the places autocomplete endpoint.
+type Place struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+}
+
+// ObservationParams holds optional filters for observation searches.
+type ObservationParams struct {
+	TaxonName    string
+	PlaceID      int
+	QualityGrade string
+	Limit        int
+}
+
+// ─── wire types ──────────────────────────────────────────────────────────────
+
+type taxaListResp struct {
+	TotalResults int         `json:"total_results"`
+	Results      []wireTaxon `json:"results"`
+}
+
+type taxonResp struct {
+	Results []wireTaxon `json:"results"`
+}
+
+type wireTaxon struct {
+	ID                  int    `json:"id"`
+	Name                string `json:"name"`
+	Rank                string `json:"rank"`
+	PreferredCommonName string `json:"preferred_common_name"`
+	WikipediaURL        string `json:"wikipedia_url"`
+	ObservationsCount   int    `json:"observations_count"`
+}
+
+type obsListResp struct {
+	TotalResults int               `json:"total_results"`
+	Results      []wireObservation `json:"results"`
+}
+
+type wireObservation struct {
+	ID           int    `json:"id"`
+	SpeciesGuess string `json:"species_guess"`
+	PlaceGuess   string `json:"place_guess"`
+	QualityGrade string `json:"quality_grade"`
+	ObservedOn   string `json:"observed_on"`
+}
+
+type speciesCountsResp struct {
+	Results []wireSpeciesCount `json:"results"`
+}
+
+type wireSpeciesCount struct {
+	Count int            `json:"count"`
+	Taxon wireCountTaxon `json:"taxon"`
+}
+
+type wireCountTaxon struct {
+	Name                string `json:"name"`
+	PreferredCommonName string `json:"preferred_common_name"`
+	Rank                string `json:"rank"`
+}
+
+type placesResp struct {
+	Results []wirePlace `json:"results"`
+}
+
+type wirePlace struct {
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+}
+
+// ─── mapping helpers ──────────────────────────────────────────────────────────
+
+func wireTaxonToTaxon(w wireTaxon) Taxon {
+	return Taxon{
+		ID:                w.ID,
+		Name:              w.Name,
+		Rank:              w.Rank,
+		CommonName:        w.PreferredCommonName,
+		WikipediaURL:      w.WikipediaURL,
+		ObservationsCount: w.ObservationsCount,
+		URL:               "https://www.inaturalist.org/taxa/" + strconv.Itoa(w.ID),
+	}
+}
+
+func wireObsToObservation(w wireObservation) Observation {
+	return Observation{
+		ID:           w.ID,
+		SpeciesGuess: w.SpeciesGuess,
+		PlaceGuess:   w.PlaceGuess,
+		QualityGrade: w.QualityGrade,
+		ObservedOn:   w.ObservedOn,
+		URL:          "https://www.inaturalist.org/observations/" + strconv.Itoa(w.ID),
+	}
+}
+
+func wireCountToPlaceCount(w wireSpeciesCount) PlaceCount {
+	return PlaceCount{
+		Count:      w.Count,
+		Name:       w.Taxon.Name,
+		CommonName: w.Taxon.PreferredCommonName,
+		Rank:       w.Taxon.Rank,
+	}
+}
+
+func wirePlaceToPlace(w wirePlace) Place {
+	return Place{
+		ID:          w.ID,
+		Name:        w.Name,
+		DisplayName: w.DisplayName,
+	}
+}
+
+// ─── public methods ───────────────────────────────────────────────────────────
+
+// SearchTaxa searches the /taxa endpoint by name.
+func (c *Client) SearchTaxa(ctx context.Context, query string, limit int) ([]Taxon, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("per_page", strconv.Itoa(limit))
+	rawURL := c.cfg.BaseURL + "/taxa?" + params.Encode()
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp taxaListResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode taxa search: %w", err)
+	}
+	out := make([]Taxon, len(resp.Results))
+	for i, w := range resp.Results {
+		out[i] = wireTaxonToTaxon(w)
+	}
+	return out, nil
+}
+
+// GetTaxon fetches a single taxon by its numeric iNaturalist ID.
+// The API wraps results in a results array; this returns the first element.
+func (c *Client) GetTaxon(ctx context.Context, id int) (Taxon, error) {
+	rawURL := c.cfg.BaseURL + "/taxa/" + strconv.Itoa(id)
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return Taxon{}, err
+	}
+	var resp taxonResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return Taxon{}, fmt.Errorf("decode taxon %d: %w", id, err)
+	}
+	if len(resp.Results) == 0 {
+		return Taxon{}, fmt.Errorf("taxon %d not found", id)
+	}
+	return wireTaxonToTaxon(resp.Results[0]), nil
+}
+
+// SearchObservations searches observation records with optional filters.
+func (c *Client) SearchObservations(ctx context.Context, p ObservationParams) ([]Observation, error) {
+	if p.Limit <= 0 {
+		p.Limit = 10
+	}
+	params := url.Values{}
+	params.Set("per_page", strconv.Itoa(p.Limit))
+	if p.TaxonName != "" {
+		params.Set("taxon_name", p.TaxonName)
+	}
+	if p.PlaceID > 0 {
+		params.Set("place_id", strconv.Itoa(p.PlaceID))
+	}
+	if p.QualityGrade != "" {
+		params.Set("quality_grade", p.QualityGrade)
+	}
+	rawURL := c.cfg.BaseURL + "/observations?" + params.Encode()
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp obsListResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode observations: %w", err)
+	}
+	out := make([]Observation, len(resp.Results))
+	for i, w := range resp.Results {
+		out[i] = wireObsToObservation(w)
+	}
+	return out, nil
+}
+
+// SpeciesCounts returns species count summaries, optionally for a place.
+func (c *Client) SpeciesCounts(ctx context.Context, placeID, limit int) ([]PlaceCount, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	params := url.Values{}
+	params.Set("per_page", strconv.Itoa(limit))
+	if placeID > 0 {
+		params.Set("place_id", strconv.Itoa(placeID))
+	}
+	rawURL := c.cfg.BaseURL + "/observations/species_counts?" + params.Encode()
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp speciesCountsResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode species counts: %w", err)
+	}
+	out := make([]PlaceCount, len(resp.Results))
+	for i, w := range resp.Results {
+		out[i] = wireCountToPlaceCount(w)
+	}
+	return out, nil
+}
+
+// SearchPlaces searches places by name using the autocomplete endpoint.
+func (c *Client) SearchPlaces(ctx context.Context, query string) ([]Place, error) {
+	params := url.Values{}
+	params.Set("q", query)
+	rawURL := c.cfg.BaseURL + "/places/autocomplete?" + params.Encode()
+
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp placesResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode places: %w", err)
+	}
+	out := make([]Place, len(resp.Results))
+	for i, w := range resp.Results {
+		out[i] = wirePlaceToPlace(w)
+	}
+	return out, nil
+}
+
+// ─── HTTP plumbing ────────────────────────────────────────────────────────────
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +351,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +360,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,21 +384,21 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, true, err
 	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
+	if w := c.cfg.Rate - time.Since(c.last); w > 0 {
+		time.Sleep(w)
 	}
 	c.last = time.Now()
 }
@@ -121,80 +409,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on inaturalist.com. It is a stand-in for the typed records you
-// will model from the real inaturalist endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `inaturalist cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
